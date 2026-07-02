@@ -1,0 +1,8 @@
+requests>=2.25.0
+urllib3>=1.26.0
+colorama>=0.4.4
+pyfiglet>=0.8.post1
+tqdm>=4.60.0
+whois>=0.9.16
+shodan>=1.26.0
+curl_cffi>=0.5.0
